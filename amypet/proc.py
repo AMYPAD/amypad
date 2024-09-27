@@ -6,7 +6,8 @@ __author__ = "Pawel Markiewicz"
 __copyright__ = "Copyright 2022-3"
 
 import logging
-import os
+import os, csv
+from glob import glob
 import shutil
 from pathlib import Path, PurePath
 
@@ -14,6 +15,11 @@ import numpy as np
 import spm12
 from miutil.fdio import hasext
 from niftypet import nimpa
+
+try:          # py<3.9
+    import importlib_resources as resources
+except ImportError:
+    from importlib import resources
 
 from .dyn_tools import dyn_timing
 from .utils import get_atlas
@@ -49,6 +55,16 @@ hmmrs_vois = {
     'thalamus': [40, 41],
     'composite': [28, 29] + list(range(52, 60)) + list(range(76,
         82)) + list(range(86, 96)) + [32, 33, 62, 63, 84, 85]}
+
+sch_vois = {}
+sch_csv = resources.files('amypet').resolve() / 'data' / 'atlas' / 'Schaefer_2018_100_Parcels.csv'
+with open(sch_csv) as f:
+    reader = csv.reader(f, skipinitialspace=True)
+    next(reader)
+    for row in reader:
+        key = row[1].split('7Networks_')[1]
+        value = [int(row[0])]
+        sch_vois[key] = value
 #----------------------------------------------------------
 
 
@@ -238,6 +254,13 @@ def extract_vois(impet, atlas, voi_dct, atlas_mask=None, outpath=None, output_ma
     # > output dictionary
     out = {}
 
+    # > get metric + ref (if UR/CL parametric images as input)
+    metric = os.path.basename(impet)[:2] if 'ref-' in str(impet) else None
+    metric = 'suvr_' if metric == 'UR' else 'cl_' if metric == 'CL' else None
+    ref = impet.split('ref-', 1)[-1].split('wUR', 1)[0] if 'ref-' in str(impet) else None
+    log.info(f' METRIC_REF: {metric}{ref}')
+    # ----------------------------------------------
+
     log.debug('Extracting volumes of interest (VOIs):')
     for voi in voi_dct:
         log.info(f'  VOI: {voi}')
@@ -257,6 +280,10 @@ def extract_vois(impet, atlas, voi_dct, atlas_mask=None, outpath=None, output_ma
 
         if msk2.dtype==type(True):
             msk2 = np.int8(msk2)
+
+        if msk2.shape != (181, 217, 181):
+            # Crop amsk to fit the desired shape
+            msk2 = msk2[0:-1, 0:-1, 0:-1]
 
         if outpath is not None and not isinstance(atlas, np.ndarray):
             nimpa.create_dir(outpath)
@@ -285,6 +312,11 @@ def extract_vois(impet, atlas, voi_dct, atlas_mask=None, outpath=None, output_ma
         if output_masks:
             out[voi]['roimsk'] = msk2
 
+        if ref:
+            voi_name = f"{metric}{voi}_ref_{ref}"
+            voi_metric = float(out[voi]['avg'])
+            out[voi]['voi_dict'] = {voi_name: voi_metric}
+
     return out
 
 
@@ -293,11 +325,13 @@ def proc_vois(
         aligned,
         cl_dct,
         atlas='hammers',
+        default_mni=False,
         voi_idx=None,
         res=1,
         outpath=None,
         apply_mask='gm',
-        timing=None):
+        timing=None,
+        fcsv=None):
     '''
     Process and prepare the VOI dynamic data for kinetic analysis.
     Arguments:
@@ -310,6 +344,7 @@ def proc_vois(
                 AAL also is supported (atlas='aal'); any other custom atlas
                 can be used if atlas is a path to the NIfTI file of the atlas;
                 for custom atlas `voi_idx` must be provided as a dictionary.
+    default_mni:option to use when applying atlas in MNI
     voi_ids:    VOI indices for composite VOIs.  Every atlas has its own
                 labelling strategy.
     res:        resolution of the atlas - the default is 1 mm voxel size
@@ -334,7 +369,7 @@ def proc_vois(
     # > get the atlas
     if isinstance(atlas, (str, PurePath)) and hasext(atlas, ('nii', 'nii.gz')):
         fatl = atlas
-    elif isinstance(atlas, str) and atlas in ['hammers', 'aal']:
+    elif isinstance(atlas, str) and atlas in ['hammers', 'aal', 'schaefer']:
         datl = get_atlas(atlas=atlas, res=res)
         fatl = datl['fatlas']
 
@@ -346,38 +381,63 @@ def proc_vois(
             dvoi = aal_vois
         elif atlas == 'hammers':
             dvoi = hmmrs_vois
+        elif atlas == 'schaefer':
+            dvoi = sch_vois
         else:
             raise ValueError('unrecognised atlas name!')
 
-    # > get the atlas and GM probability mask in PET space (in UR space) using CL inverse pipeline
-    atlgm = atl2pet(
-        fatl,
-        cl_dct,
-        fpet=None, #aligned['ur']['fur'] - this will not work
-        outpath=opth) 
+        if default_mni:
+            cl_dct['fur'] = glob(os.path.dirname(cl_dct['fqc']) + '/ur-image/*')
+            cl_dct['fcl'] = glob(os.path.dirname(cl_dct['fqc']) + '/cl-image/*wcw*')
+            voi_dct = {}
+            for fur in cl_dct['fur']:
+                rvoi = extract_vois(fur, fatl, dvoi, atlas_mask=None,
+                                    outpath=opth / f'masks_{atlas}', output_masks=True)
+                for voi in dvoi.keys():
+                    voi_dct.update(rvoi[voi]['voi_dict'])
+            rvoi = extract_vois(cl_dct['fcl'][0], fatl, dvoi, atlas_mask=None,
+                                outpath=opth / f'masks_{atlas}', output_masks=True)
+            for voi in dvoi.keys():
+                voi_dct.update(rvoi[voi]['voi_dict'])
+            vois_dct = {"path_out_pet": cl_dct['opth']}
+            vois_dct.update(voi_dct)
+            with open(fcsv, 'w', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow(list(vois_dct.keys()))
+                csv_writer.writerow(list(vois_dct.values()))
 
-    if apply_mask=='gm':
-        msk = atlgm['fgmpet']
-    elif apply_mask=='wm':
-        msk = atlgm['fwmpet']
-    else:
-        msk = None
+            return {'voi': rvoi, 'outpath': opth}
 
-    rvoi = extract_vois(fdynin, atlgm['fatlpet'], dvoi, atlas_mask=msk,
-                        outpath=opth / 'masks', output_masks=True)
+        else:
+            # > get the atlas and GM probability mask in PET space (in UR space) using CL inverse pipeline
+            atlgm = atl2pet(
+                fatl,
+                cl_dct,
+                fpet=None, #aligned['ur']['fur'] - this will not work
+                outpath=opth)
 
-    
-    if isinstance(timing, dict) and 'descr' in timing:
-        # > timing of all frames
-        tdct = dyn_timing(timing)
+            if apply_mask=='gm':
+                msk = atlgm['fgmpet']
+            elif apply_mask=='wm':
+                msk = atlgm['fwmpet']
+            else:
+                msk = None
 
-        # > frame time definitions for NiftyPAD
-        dt = tdct['niftypad']
+            rvoi = extract_vois(fdynin, atlgm['fatlpet'], dvoi, atlas_mask=msk,
+                                outpath=opth / 'masks', output_masks=True)
 
-    elif isinstance(timing, dict) and 'timings' in timing:
-        dt = timing['niftypad']
-    else:
-        dt = None
+
+            if isinstance(timing, dict) and 'descr' in timing:
+                # > timing of all frames
+                tdct = dyn_timing(timing)
+
+                # > frame time definitions for NiftyPAD
+                dt = tdct['niftypad']
+
+            elif isinstance(timing, dict) and 'timings' in timing:
+                dt = timing['niftypad']
+            else:
+                dt = None
 
     return {'dt': dt, 'voi': rvoi, 'atlas_gm': atlgm, 'outpath': opth}
 
